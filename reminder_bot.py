@@ -1,30 +1,11 @@
-from flask import Flask
-from threading import Thread
-
-# Инициализируем Flask приложение
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-def run_flask():
-    # Запускаем Flask-сервер на порту 8080 (или другом, который Replit предоставит)
-    # host='0.0.0.0' делает сервер доступным извне
-    app.run(host='0.0.0.0', port=8080) # Replit предоставит порт, но 8080 часто работает по умолчанию
-
-# Запускаем Flask-сервер в отдельном потоке, чтобы он не блокировал бота
-def keep_alive():
-    t = Thread(target=run_flask)
-    t.start()
-
-
 import logging
 import sqlite3
 import datetime
 import asyncio
 import json
+import threading # Импортируем threading для запуска Flask в отдельном потоке
 
+from flask import Flask # Импортируем Flask
 from apscheduler.schedulers.blocking import BlockingScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -40,17 +21,34 @@ from telegram.ext import (
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-logging.getLogger("httpx").setLevel(logging.WARNING) # Уменьшаем шум от httpx
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# --- Настройки Flask для поддержания активности ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    """Простая домашняя страница для Flask-сервера."""
+    return "Bot is running!"
+
+def run_flask():
+    """Запускает Flask-сервер в отдельном потоке."""
+    # Replit автоматически предоставляет порт через переменную окружения PORT.
+    # Если ее нет, используем 8080 по умолчанию.
+    port = 8080 #int(os.environ.get('PORT', 8080)) # Можно использовать os.environ.get('PORT')
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    """Запускает Flask-сервер в фоновом потоке."""
+    t = threading.Thread(target=run_flask)
+    t.daemon = True # Позволяет потоку завершаться, когда завершается основная программа
+    t.start()
+
 # --- Получение токена: ТОЛЬКО из кода (небезопасно для публичных репозиториев!) ---
-# Вставьте ваш токен Telegram здесь.
-# ВНИМАНИЕ: Если этот код будет выложен на GitHub или доступен другим,
-# ваш токен станет общедоступным, и ваш бот может быть скомпрометирован.
-# Настоятельно рекомендуется использовать переменные окружения на хостингах (например, Replit Secrets).
 TOKEN = '8031651136:AAHyIOOfWUmny-p2Lz3072cxY3yhL5LNL0o' # <-- Вставьте ваш токен Telegram сюда!
 
-if not TOKEN or TOKEN == 'ВАШ_ТОКЕН_БОТА_ЗДЕСЬ': # Проверка на заглушку
+if not TOKEN or TOKEN == 'ВАШ_ТОКЕН_БОТА_ЗДЕСЬ':
     raise ValueError("Токен Telegram не установлен. Вставьте его в строку TOKEN = '...'")
 
 # --- Функции для работы с базой данных ---
@@ -68,8 +66,8 @@ def init_db():
                 message TEXT NOT NULL,
                 reminder_time TEXT NOT NULL,
                 is_sent INTEGER DEFAULT 0,
-                interval_type TEXT, -- 'once', 'daily', 'weekly', 'specific_days'
-                specific_days TEXT -- JSON array for specific days, e.g., '[0, 2, 4]' for Mon, Wed, Fri
+                interval_type TEXT,
+                specific_days TEXT
             )
         ''')
         conn.commit()
@@ -154,16 +152,16 @@ def get_specific_days_keyboard(selected_days=None):
     for i, day in enumerate(days):
         button_text = f"{day} ✅" if i in selected_days else day
         row.append(InlineKeyboardButton(button_text, callback_data=f"day_{i}"))
-        if len(row) == 4: # По 4 кнопки в ряд
+        if len(row) == 4:
             keyboard.append(row)
             row = []
-    if row: # Добавить оставшиеся кнопки, если есть
+    if row:
         keyboard.append(row)
     keyboard.append([InlineKeyboardButton("Подтвердить дни", callback_data="confirm_days")])
     return InlineKeyboardMarkup(keyboard)
 
 # --- Глобальные состояния для обработки ввода ---
-user_states = {} # chat_id: {'state': 'waiting_for_time', 'message': 'Что напомнить?', 'interval_type': 'once', 'specific_days': []}
+user_states = {}
 
 # --- Функции обработчиков команд ---
 
@@ -198,7 +196,7 @@ async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Показывает список активных напоминаний пользователя."""
     chat_id = update.effective_chat.id
     reminders = get_reminders_from_db(is_sent=0)
-    user_reminders = [r for r in reminders if r[1] == chat_id] # r[1] - chat_id
+    user_reminders = [r for r in reminders if r[1] == chat_id]
 
     if not user_reminders:
         await update.message.reply_text("У тебя пока нет активных напоминаний.")
@@ -218,7 +216,6 @@ async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         elif interval_type == 'weekly':
             interval_display = "Еженедельно"
         elif interval_type == 'specific_days':
-            # `json` уже импортирован в начале файла
             days_map = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
             selected_days_indices = json.loads(specific_days_str) if specific_days_str else []
             selected_days_names = [days_map[i] for i in selected_days_indices if i in days_map]
@@ -246,15 +243,13 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     elif user_state and user_state['state'] == 'waiting_for_time':
         try:
-            # Парсим введенное время
             reminder_time = datetime.datetime.strptime(update.message.text, "%d.%m.%Y %H:%M")
 
-            # Проверяем, что время не в прошлом
             if reminder_time < datetime.datetime.now():
                 await update.message.reply_text("Время напоминания не может быть в прошлом. Пожалуйста, введи корректное время.")
                 return
 
-            user_states[chat_id]['reminder_time'] = reminder_time.isoformat() # Сохраняем как ISO-строку
+            user_states[chat_id]['reminder_time'] = reminder_time.isoformat()
             user_states[chat_id]['state'] = 'waiting_for_interval'
             await update.message.reply_text(
                 "Как часто напоминать?",
@@ -267,53 +262,47 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         await update.message.reply_text("Я тебя не понимаю. Используй /remind, чтобы начать создание напоминания.")
 
-
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает нажатия кнопок на клавиатурах."""
     query = update.callback_query
-    await query.answer() # Всегда отвечаем на callbackQuery
+    await query.answer()
 
     chat_id = query.message.chat_id
     user_state = user_states.get(chat_id)
 
     if query.data.startswith("interval_"):
-        # Обработка выбора интервала
         interval_type = query.data.split('_')[1]
         user_states[chat_id]['interval_type'] = interval_type
 
         if interval_type == 'specific_days':
-            # Начинаем выбор дней недели
             user_states[chat_id]['state'] = 'waiting_for_specific_days'
-            user_states[chat_id]['specific_days'] = [] # Инициализируем список выбранных дней
+            user_states[chat_id]['specific_days'] = []
             await query.edit_message_text(
                 text="Выбери дни недели:",
                 reply_markup=get_specific_days_keyboard()
             )
         else:
-            # Для однократных, ежедневных, еженедельных напоминаний
             message_text = user_states[chat_id]['message']
             reminder_time_iso = user_states[chat_id]['reminder_time']
             
             add_reminder_to_db(chat_id, message_text, reminder_time_iso, interval_type)
-            del user_states[chat_id] # Очищаем состояние
+            del user_states[chat_id]
             await query.edit_message_text(f"Напоминание '{message_text}' успешно создано!")
 
     elif query.data.startswith("day_"):
-        # Обработка выбора конкретного дня недели
         if user_state and user_state['state'] == 'waiting_for_specific_days':
             day_index = int(query.data.split('_')[1])
             if day_index in user_state['specific_days']:
-                user_state['specific_days'].remove(day_index) # Отменяем выбор
+                user_state['specific_days'].remove(day_index)
             else:
-                user_state['specific_days'].append(day_index) # Выбираем
-            user_state['specific_days'].sort() # Для порядка
+                user_state['specific_days'].append(day_index)
+            user_state['specific_days'].sort()
 
             await query.edit_message_reply_markup(
                 reply_markup=get_specific_days_keyboard(user_state['specific_days'])
             )
 
     elif query.data == "confirm_days":
-        # Подтверждение выбора дней недели
         if user_state and user_state['state'] == 'waiting_for_specific_days':
             if not user_state['specific_days']:
                 await query.edit_message_text("Пожалуйста, выбери хотя бы один день недели.")
@@ -328,25 +317,22 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.edit_message_text(f"Напоминание '{message_text}' успешно создано по выбранным дням!")
 
     elif query.data.startswith("delete_"):
-        # Обработка удаления напоминания
         reminder_id = int(query.data.split('_')[1])
         delete_reminder_from_db(reminder_id)
         await query.edit_message_text("Напоминание удалено.")
-        # Можно обновить список напоминаний или предложить посмотреть /myreminders снова
-        # await my_reminders(update, context) # Если хотим сразу обновить список
 
 # --- Функция для планировщика (APScheduler) ---
 def send_scheduled_reminders(bot):
     """Проверяет напоминания в БД и отправляет их."""
     now = datetime.datetime.now().replace(second=0, microsecond=0)
-    current_weekday = now.weekday() # Понедельник = 0, Воскресенье = 6
+    current_weekday = now.weekday()
 
     reminders = get_reminders_from_db(is_sent=0)
 
     for r_id, chat_id, message, reminder_time_str, interval_type, specific_days_str in reminders:
         try:
             rem_datetime = datetime.datetime.fromisoformat(reminder_time_str)
-            rem_datetime = rem_datetime.replace(second=0, microsecond=0) # Обрезаем секунды
+            rem_datetime = rem_datetime.replace(second=0, microsecond=0)
 
             should_send = False
 
@@ -354,48 +340,36 @@ def send_scheduled_reminders(bot):
                 if rem_datetime == now:
                     should_send = True
             elif interval_type == 'daily':
-                # Для ежедневных: время совпадает с текущим временем, без учета даты
                 if rem_datetime.time() == now.time():
                     should_send = True
             elif interval_type == 'weekly':
-                # Для еженедельных: время и день недели совпадают
                 if rem_datetime.weekday() == current_weekday and rem_datetime.time() == now.time():
                     should_send = True
             elif interval_type == 'specific_days':
-                # `json` уже импортирован в начале файла
                 selected_days_indices = json.loads(specific_days_str) if specific_days_str else []
                 if current_weekday in selected_days_indices and rem_datetime.time() == now.time():
                     should_send = True
 
             if should_send:
-                import asyncio
+                # Создаем асинхронную задачу для отправки сообщения,
+                # так как send_scheduled_reminders вызывается из синхронного потока.
                 asyncio.create_task(bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание: {message}"))
                 logger.info(f"Отправлено напоминание с ID {r_id} для chat_id {chat_id}.")
-                # Для однократных напоминаний - помечаем как отправленное
                 if interval_type == 'once':
                     mark_reminder_as_sent(r_id)
-                # Для повторяющихся напоминаний:
-                # В текущей реализации они останутся в БД с is_sent=0 и будут отправляться снова,
-                # когда условия совпадут. Это может привести к дублированию, если бот перезапустится
-                # в ту же минуту. Для предотвращения дублирования требуется более сложная логика,
-                # например, поле 'last_sent_timestamp' в БД и проверка по нему.
 
         except Exception as e:
             logger.error(f"Ошибка при обработке напоминания ID {r_id}: {e}", exc_info=True)
-
 
 # --- Главная функция бота ---
 def main() -> None:
     """Запускает бота."""
     logging.info("Запуск бота...")
 
-    # Инициализация базы данных
     init_db()
 
-    # Инициализация приложения бота
     application = Application.builder().token(TOKEN).build()
 
-    # Настройка обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("remind", remind))
@@ -403,17 +377,16 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(button))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input))
 
-    # --- Инициализация планировщика ---
+    # --- Инициализация и запуск планировщика в отдельном потоке ---
     scheduler = BlockingScheduler()
     scheduler.add_job(
         send_scheduled_reminders,
         'interval',
-        seconds=60, # Проверяем напоминания каждую минуту
+        seconds=60,
         args=(application.bot,)
     )
     
     # Запускаем планировщик в отдельном потоке
-    import threading
     scheduler_thread = threading.Thread(target=scheduler.start)
     scheduler_thread.daemon = True
     scheduler_thread.start()
@@ -421,22 +394,10 @@ def main() -> None:
     logging.info("Бот запущен и ожидает обновлений...")
     application.run_polling(drop_pending_updates=True)
 
-
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен пользователем (KeyboardInterrupt).")
-    except Exception as e:
-        logger.error(f"Непредвиденная ошибка при запуске бота: {e}", exc_info=True)
+    # Запускаем Flask-сервер для поддержания активности
+    keep_alive() # <--- Эта строка запускает Flask-сервер
 
-def main() -> None:
-    # ... (весь код main()) ...
-    application.run_polling(drop_pending_updates=True) # Эта строка уже есть
-
-if __name__ == '__main__':
-    # Добавляем вызов keep_alive() перед запуском бота
-    keep_alive() # <--- Эту строку нужно добавить
     try:
         main()
     except KeyboardInterrupt:
