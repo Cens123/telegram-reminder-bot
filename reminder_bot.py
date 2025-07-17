@@ -1,6 +1,11 @@
+
 import logging
 import sqlite3
 import datetime
+import asyncio
+import os
+import json # Добавляем для работы с JSON, если ещё не было
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -11,612 +16,400 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-import asyncio # Для асинхронной работы с scheduler
 
-# Включите логирование, чтобы видеть, что происходит
+# --- Настройки логгирования ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+logging.getLogger("httpx").setLevel(logging.WARNING) # Уменьшаем шум от httpx
 logger = logging.getLogger(__name__)
 
-# Замените 'ВАШ_ТОКЕН_БОТА' на токен, который вы получили от BotFather
-TOKEN = '8031651136:AAFn6zQlfNO4WBdDxACko_MlBzJ19lmocBY'
+# --- Получение токена: сначала из переменной окружения, затем из кода ---
+TOKEN_HARDCODED = '8031651136:AAFn6zQlfNO4WBdDxACko_MlBzJ19lmocBY' # <-- Вставьте ваш токен сюда, если не используете переменные окружения!
+                                       # Например: '1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+TOKEN = os.environ.get('TOKEN') # Пытаемся получить токен из переменной окружения
+if not TOKEN:
+    # Если переменная окружения не установлена, используем жестко закодированный токен
+    TOKEN = TOKEN_HARDCODED
+    logger.warning("Токен Telegram взят из кода (не из переменных окружения). "
+                   "Рекомендуется использовать переменные окружения для продакшена.")
+
+if not TOKEN or TOKEN == 'ВАШ_ТОКЕН_БОТА_ЗДЕСЬ':
+    raise ValueError("Токен Telegram не установлен. Установите его как переменную окружения 'TOKEN' или вставьте в 'TOKEN_HARDCODED'.")
+
+# --- Функции для работы с базой данных ---
 DB_NAME = 'reminders.db'
 
-# Инициализация планировщика задач
-scheduler = AsyncIOScheduler()
-
-# --- База данных ---
 def init_db():
-    """Инициализирует базу данных."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            state TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS reminders (
-            reminder_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            text TEXT NOT NULL,
-            time TEXT NOT NULL, -- Формат HH:MM
-            days TEXT NOT NULL, -- 'everyday', 'weekdays', 'specific:mon,tue,wed'
-            active INTEGER DEFAULT 1,
-            FOREIGN KEY (user_id) REFERENCES users (user_id)
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-def save_user_state(user_id: int, state: str):
-    """Сохраняет состояние пользователя."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('INSERT OR REPLACE INTO users (user_id, state) VALUES (?, ?)', (user_id, state))
-    conn.commit()
-    conn.close()
-
-def get_user_state(user_id: int) -> str:
-    """Получает состояние пользователя."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT state FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else 'start'
-
-def add_reminder_to_db(user_id: int, text: str, time: str, days: str) -> int:
-    """Добавляет напоминание в базу данных и возвращает его ID."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        'INSERT INTO reminders (user_id, text, time, days) VALUES (?, ?, ?, ?)',
-        (user_id, text, time, days)
-    )
-    reminder_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return reminder_id
-
-def get_reminders_from_db(user_id: int) -> list:
-    """Получает все активные напоминания пользователя."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT reminder_id, text, time, days FROM reminders WHERE user_id = ? AND active = 1', (user_id,))
-    reminders = cursor.fetchall()
-    conn.close()
-    return reminders
-
-def get_reminder_by_id(reminder_id: int) -> tuple | None:
-    """Получает напоминание по его ID."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT reminder_id, user_id, text, time, days FROM reminders WHERE reminder_id = ?', (reminder_id,))
-    reminder = cursor.fetchone()
-    conn.close()
-    return reminder
-
-def update_reminder_in_db(reminder_id: int, text: str = None, time: str = None, days: str = None):
-    """Обновляет напоминание в базе данных."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    updates = []
-    params = []
-    if text:
-        updates.append("text = ?")
-        params.append(text)
-    if time:
-        updates.append("time = ?")
-        params.append(time)
-    if days:
-        updates.append("days = ?")
-        params.append(days)
-
-    if updates:
-        query = f"UPDATE reminders SET {', '.join(updates)} WHERE reminder_id = ?"
-        params.append(reminder_id)
-        cursor.execute(query, tuple(params))
+    """Инициализирует базу данных SQLite."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                reminder_time TEXT NOT NULL,
+                is_sent INTEGER DEFAULT 0,
+                interval_type TEXT, -- 'once', 'daily', 'weekly', 'specific_days'
+                specific_days TEXT -- JSON array for specific days, e.g., '[0, 2, 4]' for Mon, Wed, Fri
+            )
+        ''')
         conn.commit()
-    conn.close()
+        conn.close()
+        logger.info("База данных успешно инициализирована или уже существует.")
+    except Exception as e:
+        logger.error(f"Ошибка при инициализации базы данных: {e}", exc_info=True)
 
-def delete_reminder_from_db(reminder_id: int):
-    """Удаляет напоминание из базы данных (деактивирует)."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE reminders SET active = 0 WHERE reminder_id = ?', (reminder_id,))
-    conn.commit()
-    conn.close()
-
-def count_active_reminders(user_id: int) -> int:
-    """Считает количество активных напоминаний у пользователя."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM reminders WHERE user_id = ? AND active = 1', (user_id,))
-    count = cursor.fetchone()[0]
-    conn.close()
-    return count
-
-# --- Функции планировщика APScheduler ---
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE, user_id: int, reminder_text: str):
-    """Отправляет напоминание пользователю."""
-    await context.bot.send_message(chat_id=user_id, text=f"🔔 Напоминание: {reminder_text}")
-    logger.info(f"Напоминание '{reminder_text}' отправлено пользователю {user_id}")
-
-
-def schedule_reminder_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, reminder_id: int, text: str, time_str: str, days_str: str):
-    """Планирует задачу для напоминания."""
-    # Удаляем старую задачу, если она есть
-    job_id = f"reminder_{user_id}_{reminder_id}"
-    if scheduler.get_job(job_id):
-        scheduler.remove_job(job_id)
-
-    hour, minute = map(int, time_str.split(':'))
-
-    if days_str == 'everyday':
-        scheduler.add_job(send_reminder, 'cron', hour=hour, minute=minute, args=[context, user_id, text], id=job_id)
-        logger.info(f"Запланировано напоминание '{text}' для {user_id} ежедневно в {time_str}")
-    elif days_str == 'weekdays':
-        # Дни недели в APScheduler: 0=Понедельник, 1=Вторник, ..., 6=Воскресенье
-        scheduler.add_job(send_reminder, 'cron', day_of_week='mon-fri', hour=hour, minute=minute, args=[context, user_id, text], id=job_id)
-        logger.info(f"Запланировано напоминание '{text}' для {user_id} по будням в {time_str}")
-    elif days_str.startswith('specific:'):
-        specific_days_codes = {
-            'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6
-        }
-        days_list = [specific_days_codes[d.strip()] for d in days_str[len('specific:'):].split(',')]
-        scheduler.add_job(send_reminder, 'cron', day_of_week=days_list, hour=hour, minute=minute, args=[context, user_id, text], id=job_id)
-        logger.info(f"Запланировано напоминание '{text}' для {user_id} по дням {days_list} в {time_str}")
-
-# --- Обработчики команд и сообщений ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает команду /start."""
-    user_id = update.effective_user.id
-    init_db() # Убедимся, что база данных инициализирована
-    save_user_state(user_id, 'start')
-
-    keyboard = [
-        [
-            InlineKeyboardButton("Базовый пресет 🚀", callback_data="preset"),
-            InlineKeyboardButton("Настроить свои напоминания ⚙️", callback_data="custom"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_html(
-        f"Привет, {update.effective_user.mention_html()}! 👋\n"
-        "Я бот для напоминаний. Помогу тебе ничего не забыть.\n\n"
-        "Для начала, выбери, как ты хочешь настроить напоминания:",
-        reply_markup=reply_markup,
-    )
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает нажатия на Inline кнопки."""
-    query = update.callback_query
-    await query.answer() # Отвечаем на callbackQuery, чтобы кнопка перестала быть "висячей"
-    user_id = query.from_user.id
-
-    if query.data == "preset":
-        # Базовый пресет напоминаний
-        base_reminders = [
-            {"text": "Сделать зарядку", "time": "10:00", "days": "everyday"},
-            {"text": "Посмотреть мотивирующий ролик", "time": "10:00", "days": "everyday"},
-            {"text": "Почитать книгу", "time": "20:00", "days": "everyday"},
-            {"text": "Составить планы на завтрашний день", "time": "22:00", "days": "everyday"},
-        ]
-        # Проверим, чтобы не добавить больше 5 напоминаний
-        current_reminders_count = count_active_reminders(user_id)
-        if current_reminders_count + len(base_reminders) > 5:
-            await query.edit_message_text("Не могу добавить базовый пресет, у вас уже слишком много напоминаний (максимум 5). Удалите некоторые, чтобы добавить пресет.")
-            return
-
-        for r in base_reminders:
-            reminder_id = add_reminder_to_db(user_id, r["text"], r["time"], r["days"])
-            schedule_reminder_job(context, user_id, reminder_id, r["text"], r["time"], r["days"])
-
-        await query.edit_message_text(
-            "Базовый пресет напоминаний успешно установлен!\n"
-            "Вы можете просмотреть и отредактировать их с помощью команды /myreminders."
+def add_reminder_to_db(chat_id, message, reminder_time, interval_type='once', specific_days=None):
+    """Добавляет напоминание в базу данных."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO reminders (chat_id, message, reminder_time, interval_type, specific_days) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, message, reminder_time, interval_type, specific_days)
         )
-        save_user_state(user_id, 'start')
+        conn.commit()
+        conn.close()
+        logger.info(f"Напоминание '{message}' для {chat_id} на {reminder_time} добавлено.")
+        return cursor.lastrowid
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении напоминания в БД: {e}", exc_info=True)
+        return None
 
-    elif query.data == "custom":
-        # Настроить свои напоминания
-        await query.edit_message_text("Отлично! Давайте создадим ваше первое напоминание.")
-        await ask_for_reminder_text(user_id, context)
+def get_reminders_from_db(is_sent=0):
+    """Получает напоминания из базы данных."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, chat_id, message, reminder_time, interval_type, specific_days FROM reminders WHERE is_sent = ?", (is_sent,))
+        reminders = cursor.fetchall()
+        conn.close()
+        return reminders
+    except Exception as e:
+        logger.error(f"Ошибка при получении напоминаний из БД: {e}", exc_info=True)
+        return []
 
-    elif query.data == "add_reminder":
-        if count_active_reminders(user_id) >= 5:
-            await query.edit_message_text("Вы достигли лимита в 5 напоминаний в день. Удалите некоторые, чтобы добавить новые.")
-            return
-        await query.edit_message_text("Хорошо, введите текст для нового напоминания:")
-        save_user_state(user_id, 'awaiting_reminder_text')
+def mark_reminder_as_sent(reminder_id):
+    """Помечает напоминание как отправленное."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE reminders SET is_sent = 1 WHERE id = ?", (reminder_id,))
+        conn.commit()
+        conn.close()
+        logger.info(f"Напоминание с ID {reminder_id} помечено как отправленное.")
+    except Exception as e:
+        logger.error(f"Ошибка при пометке напоминания как отправленного: {e}", exc_info=True)
 
-    elif query.data.startswith("edit_reminder_"):
-        reminder_id = int(query.data.split('_')[2])
-        context.user_data['editing_reminder_id'] = reminder_id
-        await query.edit_message_text("Что вы хотите отредактировать в этом напоминании?",
-                                     reply_markup=InlineKeyboardMarkup([
-                                         [InlineKeyboardButton("Текст", callback_data=f"edit_text_{reminder_id}")],
-                                         [InlineKeyboardButton("Время", callback_data=f"edit_time_{reminder_id}")],
-                                         [InlineKeyboardButton("Дни недели", callback_data=f"edit_days_{reminder_id}")],
-                                         [InlineKeyboardButton("Назад к моим напоминаниям", callback_data="my_reminders")]
-                                     ]))
-        save_user_state(user_id, 'editing_reminder')
+def delete_reminder_from_db(reminder_id):
+    """Удаляет напоминание из базы данных."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+        conn.commit()
+        conn.close()
+        logger.info(f"Напоминание с ID {reminder_id} удалено из БД.")
+    except Exception as e:
+        logger.error(f"Ошибка при удалении напоминания из БД: {e}", exc_info=True)
 
-    elif query.data.startswith("edit_text_"):
-        reminder_id = int(query.data.split('_')[2])
-        context.user_data['editing_reminder_id'] = reminder_id
-        await query.edit_message_text("Введите новый текст для напоминания:")
-        save_user_state(user_id, 'awaiting_edit_text')
+# --- Вспомогательные функции для клавиатуры и времени ---
 
-    elif query.data.startswith("edit_time_"):
-        reminder_id = int(query.data.split('_')[2])
-        context.user_data['editing_reminder_id'] = reminder_id
-        await query.edit_message_text("Введите новое время для напоминания в формате ЧЧ:ММ (например, 14:30):")
-        save_user_state(user_id, 'awaiting_edit_time')
-
-    elif query.data.startswith("edit_days_"):
-        reminder_id = int(query.data.split('_')[2])
-        context.user_data['editing_reminder_id'] = reminder_id
-        await query.edit_message_text("Выберите новые дни недели для напоминания:", reply_markup=get_days_keyboard())
-        save_user_state(user_id, 'awaiting_edit_days')
-
-    elif query.data.startswith("delete_reminder_"):
-        reminder_id = int(query.data.split('_')[2])
-        delete_reminder_from_db(reminder_id)
-        # Удаляем задачу из планировщика
-        job_id = f"reminder_{user_id}_{reminder_id}"
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
-        await query.edit_message_text("Напоминание успешно удалено.")
-        await show_my_reminders(update, context) # Обновляем список напоминаний
-
-    elif query.data == "my_reminders":
-        await show_my_reminders(update, context)
-
-    # Обработка выбора дней недели при создании/редактировании
-    elif query.data in ['days_everyday', 'days_weekdays', 'days_specific']:
-        context.user_data['selected_days_type'] = query.data
-        if query.data == 'days_specific':
-            keyboard = [
-                [InlineKeyboardButton("Пн", callback_data="day_mon"),
-                 InlineKeyboardButton("Вт", callback_data="day_tue"),
-                 InlineKeyboardButton("Ср", callback_data="day_wed")],
-                [InlineKeyboardButton("Чт", callback_data="day_thu"),
-                 InlineKeyboardButton("Пт", callback_data="day_fri"),
-                 InlineKeyboardButton("Сб", callback_data="day_sat")],
-                [InlineKeyboardButton("Вс", callback_data="day_sun")],
-                [InlineKeyboardButton("Сохранить дни", callback_data="save_specific_days")]
-            ]
-            await query.edit_message_text("Выберите конкретные дни недели:", reply_markup=InlineKeyboardMarkup(keyboard))
-            context.user_data['specific_days'] = []
-        else:
-            # Сохраняем выбранный тип дней
-            days_str = ""
-            if query.data == 'days_everyday':
-                days_str = 'everyday'
-            elif query.data == 'days_weekdays':
-                days_str = 'weekdays'
-
-            current_state = get_user_state(user_id)
-            if current_state == 'awaiting_days':
-                context.user_data['reminder_days'] = days_str
-                await ask_for_reminder_time(user_id, context)
-            elif current_state == 'awaiting_edit_days':
-                reminder_id = context.user_data.get('editing_reminder_id')
-                if reminder_id:
-                    update_reminder_in_db(reminder_id, days=days_str)
-                    reminder_data = get_reminder_by_id(reminder_id)
-                    if reminder_data:
-                        r_id, u_id, text, time, days = reminder_data
-                        schedule_reminder_job(context, u_id, r_id, text, time, days)
-                    await query.edit_message_text("Дни недели успешно обновлены.")
-                    await show_my_reminders(update, context)
-                save_user_state(user_id, 'start') # Возвращаем в начальное состояние
-            else:
-                 await query.edit_message_text("Произошла ошибка в логике выбора дней. Пожалуйста, попробуйте снова с /start.")
-
-    elif query.data.startswith("day_"):
-        day = query.data.split('_')[1]
-        if day not in context.user_data['specific_days']:
-            context.user_data['specific_days'].append(day)
-        # Обновляем сообщение с выбранными днями
-        selected_days_text = ", ".join([d.upper() for d in context.user_data['specific_days']])
-        await query.edit_message_text(f"Выбрано: {selected_days_text}\nВыберите конкретные дни недели:", reply_markup=get_specific_days_keyboard(context.user_data['specific_days']))
-
-    elif query.data == "save_specific_days":
-        if not context.user_data.get('specific_days'):
-            await query.edit_message_text("Вы не выбрали ни одного дня. Пожалуйста, выберите дни или отмените.")
-            return
-
-        specific_days_str = "specific:" + ",".join(context.user_data['specific_days'])
-
-        current_state = get_user_state(user_id)
-        if current_state == 'awaiting_days':
-            context.user_data['reminder_days'] = specific_days_str
-            await ask_for_reminder_time(user_id, context)
-        elif current_state == 'awaiting_edit_days':
-            reminder_id = context.user_data.get('editing_reminder_id')
-            if reminder_id:
-                update_reminder_in_db(reminder_id, days=specific_days_str)
-                reminder_data = get_reminder_by_id(reminder_id)
-                if reminder_data:
-                    r_id, u_id, text, time, days = reminder_data
-                    schedule_reminder_job(context, u_id, r_id, text, time, days)
-                await query.edit_message_text("Дни недели успешно обновлены.")
-                await show_my_reminders(update, context)
-            save_user_state(user_id, 'start') # Возвращаем в начальное состояние
-        else:
-            await query.edit_message_text("Произошла ошибка в логике сохранения дней. Пожалуйста, попробуйте снова с /start.")
-
-
-async def ask_for_reminder_text(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запрашивает текст напоминания."""
+def get_interval_keyboard():
+    """Возвращает клавиатуру для выбора интервала напоминания."""
     keyboard = [
-        [InlineKeyboardButton("Сделать зарядку", callback_data="preset_text_charge")],
-        [InlineKeyboardButton("Посмотреть мотивирующий ролик", callback_data="preset_text_motiv")],
-        [InlineKeyboardButton("Почитать книгу", callback_data="preset_text_book")],
-        [InlineKeyboardButton("Составить планы на завтрашний день", callback_data="preset_text_plans")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await context.bot.send_message(
-        chat_id=user_id,
-        text="Выбери базовое напоминание или введи свой текст:",
-        reply_markup=reply_markup,
-    )
-    save_user_state(user_id, 'awaiting_reminder_text')
-
-async def ask_for_reminder_time(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запрашивает время напоминания."""
-    await context.bot.send_message(
-        chat_id=user_id,
-        text="Теперь введи время для напоминания в формате ЧЧ:ММ (например, 14:30):"
-    )
-    save_user_state(user_id, 'awaiting_reminder_time')
-
-async def ask_for_reminder_days(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запрашивает дни недели для напоминания."""
-    await context.bot.send_message(
-        chat_id=user_id,
-        text="Когда должно приходить напоминание?",
-        reply_markup=get_days_keyboard()
-    )
-    save_user_state(user_id, 'awaiting_days')
-
-def get_days_keyboard():
-    """Возвращает клавиатуру для выбора дней недели."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Каждый день", callback_data="days_everyday")],
-        [InlineKeyboardButton("Кроме выходных (Пн-Пт)", callback_data="days_weekdays")],
-        [InlineKeyboardButton("Выбрать конкретные дни", callback_data="days_specific")]
-    ])
-
-def get_specific_days_keyboard(selected_days: list):
-    """Возвращает клавиатуру для выбора конкретных дней с подсветкой выбранных."""
-    keyboard = [
-        [InlineKeyboardButton(f"{'✅ ' if 'mon' in selected_days else ''}Пн", callback_data="day_mon"),
-         InlineKeyboardButton(f"{'✅ ' if 'tue' in selected_days else ''}Вт", callback_data="day_tue"),
-         InlineKeyboardButton(f"{'✅ ' if 'wed' in selected_days else ''}Ср", callback_data="day_wed")],
-        [InlineKeyboardButton(f"{'✅ ' if 'thu' in selected_days else ''}Чт", callback_data="day_thu"),
-         InlineKeyboardButton(f"{'✅ ' if 'fri' in selected_days else ''}Пт", callback_data="day_fri"),
-         InlineKeyboardButton(f"{'✅ ' if 'sat' in selected_days else ''}Сб", callback_data="day_sat")],
-        [InlineKeyboardButton(f"{'✅ ' if 'sun' in selected_days else ''}Вс", callback_data="day_sun")],
-        [InlineKeyboardButton("✅ Сохранить выбранные дни", callback_data="save_specific_days")]
+        [InlineKeyboardButton("Однократно", callback_data="interval_once")],
+        [InlineKeyboardButton("Ежедневно", callback_data="interval_daily")],
+        [InlineKeyboardButton("Еженедельно", callback_data="interval_weekly")],
+        [InlineKeyboardButton("По дням недели", callback_data="interval_specific_days")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает текстовые сообщения пользователя в зависимости от состояния."""
-    user_id = update.effective_user.id
-    user_state = get_user_state(user_id)
-    text = update.message.text
-
-    if user_state == 'awaiting_reminder_text':
-        if text.startswith('preset_text_'): # Если пользователь нажал на кнопку пресета
-            preset_map = {
-                "preset_text_charge": "Сделать зарядку",
-                "preset_text_motiv": "Посмотреть мотивирующий ролик",
-                "preset_text_book": "Почитать книгу",
-                "preset_text_plans": "Составить планы на завтрашний день",
-            }
-            context.user_data['reminder_text'] = preset_map.get(text, text) # используем text для случая если кнопка не найдена (не должна быть)
-        else: # Если пользователь ввел свой текст
-            context.user_data['reminder_text'] = text
-        await ask_for_reminder_days(user_id, context) # Изменен порядок: сначала дни, потом время
-
-    elif user_state == 'awaiting_reminder_time':
-        # Простая валидация времени ЧЧ:ММ
-        try:
-            hour, minute = map(int, text.split(':'))
-            if not (0 <= hour <= 23 and 0 <= minute <= 59):
-                raise ValueError
-            context.user_data['reminder_time'] = text
-            # Все данные собраны, добавляем напоминание
-            reminder_text = context.user_data.get('reminder_text')
-            reminder_days = context.user_data.get('reminder_days')
-            
-            if reminder_text and text and reminder_days:
-                # Проверяем лимит напоминаний
-                if count_active_reminders(user_id) >= 5:
-                    await update.message.reply_text("Вы достигли лимита в 5 напоминаний в день. Удалите некоторые, чтобы добавить новые.")
-                    save_user_state(user_id, 'start')
-                    return
-                
-                reminder_id = add_reminder_to_db(user_id, reminder_text, text, reminder_days)
-                schedule_reminder_job(context, user_id, reminder_id, reminder_text, text, reminder_days)
-                await update.message.reply_text(f"Отлично! Напоминание '{reminder_text}' установлено на {text} ({get_days_display_name(reminder_days)}).")
-                save_user_state(user_id, 'start')
-            else:
-                await update.message.reply_text("Произошла ошибка. Пожалуйста, попробуйте создать напоминание снова с /addreminder.")
-                save_user_state(user_id, 'start')
-
-        except ValueError:
-            await update.message.reply_text("Неверный формат времени. Пожалуйста, введите время в формате ЧЧ:ММ (например, 14:30).")
-
-    elif user_state == 'awaiting_edit_text':
-        reminder_id = context.user_data.get('editing_reminder_id')
-        if reminder_id:
-            update_reminder_in_db(reminder_id, text=text)
-            reminder_data = get_reminder_by_id(reminder_id)
-            if reminder_data:
-                r_id, u_id, r_text, r_time, r_days = reminder_data
-                schedule_reminder_job(context, u_id, r_id, r_text, r_time, r_days) # Перепланируем с новым текстом
-            await update.message.reply_text("Текст напоминания успешно обновлен.")
-            await show_my_reminders(update, context) # Обновляем список напоминаний
-        save_user_state(user_id, 'start')
-
-    elif user_state == 'awaiting_edit_time':
-        reminder_id = context.user_data.get('editing_reminder_id')
-        try:
-            hour, minute = map(int, text.split(':'))
-            if not (0 <= hour <= 23 and 0 <= minute <= 59):
-                raise ValueError
-            if reminder_id:
-                update_reminder_in_db(reminder_id, time=text)
-                reminder_data = get_reminder_by_id(reminder_id)
-                if reminder_data:
-                    r_id, u_id, r_text, r_time, r_days = reminder_data
-                    schedule_reminder_job(context, u_id, r_id, r_text, r_time, r_days) # Перепланируем с новым временем
-                await update.message.reply_text("Время напоминания успешно обновлено.")
-                await show_my_reminders(update, context) # Обновляем список напоминаний
-            save_user_state(user_id, 'start')
-        except ValueError:
-            await update.message.reply_text("Неверный формат времени. Пожалуйста, введите время в формате ЧЧ:ММ (например, 14:30).")
-
-    else:
-        # Если бот не в ожидании конкретного ввода, можно предложить список команд
-        await update.message.reply_text(
-            "Извини, я не понял твою команду. "
-            "Пожалуйста, используй кнопки или команды:\n"
-            "/start - начать или перезапустить бота\n"
-            "/addreminder - добавить новое напоминание\n"
-            "/myreminders - показать мои напоминания"
-        )
-
-async def add_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает команду /addreminder."""
-    user_id = update.effective_user.id
-    if count_active_reminders(user_id) >= 5:
-        await update.message.reply_text("Вы достигли лимита в 5 напоминаний в день. Удалите некоторые, чтобы добавить новые.")
-        return
-
-    await ask_for_reminder_text(user_id, context)
-
-async def show_my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает список напоминаний пользователя."""
-    user_id = update.effective_user.id
-    reminders = get_reminders_from_db(user_id)
-
-    if not reminders:
-        await update.message.reply_text("У вас пока нет активных напоминаний. Используйте /addreminder, чтобы добавить новое.")
-        return
-
-    message_text = "Ваши текущие напоминания:\n\n"
+def get_specific_days_keyboard(selected_days=None):
+    """Возвращает клавиатуру для выбора дней недели."""
+    if selected_days is None:
+        selected_days = []
+    days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     keyboard = []
-    for r_id, text, time, days_str in reminders:
-        days_display = get_days_display_name(days_str)
-        message_text += f"▪️ *{text}* в {time} ({days_display})\n"
-        keyboard.append([
-            InlineKeyboardButton(f"⚙️ Редактировать '{text}'", callback_data=f"edit_reminder_{r_id}"),
-            InlineKeyboardButton(f"🗑️ Удалить '{text}'", callback_data=f"delete_reminder_{r_id}")
-        ])
-    
-    keyboard.append([InlineKeyboardButton("➕ Добавить новое напоминание", callback_data="add_reminder")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # Отправляем или редактируем сообщение
-    if update.callback_query:
-        await update.callback_query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
+    row = []
+    for i, day in enumerate(days):
+        button_text = f"{day} ✅" if i in selected_days else day
+        row.append(InlineKeyboardButton(button_text, callback_data=f"day_{i}"))
+        if len(row) == 4: # По 4 кнопки в ряд
+            keyboard.append(row)
+            row = []
+    if row: # Добавить оставшиеся кнопки, если есть
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("Подтвердить дни", callback_data="confirm_days")])
+    return InlineKeyboardMarkup(keyboard)
 
-def get_days_display_name(days_str: str) -> str:
-    """Возвращает читаемое название для дней недели."""
-    if days_str == 'everyday':
-        return 'Каждый день'
-    elif days_str == 'weekdays':
-        return 'По будням'
-    elif days_str.startswith('specific:'):
-        specific_days_map = {
-            'mon': 'Пн', 'tue': 'Вт', 'wed': 'Ср', 'thu': 'Чт', 'fri': 'Пт', 'sat': 'Сб', 'sun': 'Вс'
-        }
-        days_codes = days_str[len('specific:'):].split(',')
-        return ", ".join([specific_days_map[d.strip()] for d in days_codes])
-    return 'Неизвестно'
+# --- Глобальные состояния для обработки ввода ---
+user_states = {} # chat_id: {'state': 'waiting_for_time', 'message': 'Что напомнить?', 'interval_type': 'once', 'specific_days': []}
 
+# --- Функции обработчиков команд ---
 
-# --- Загрузка напоминаний при запуске бота ---
-async def load_reminders_on_startup(application: Application):
-    """Загружает все активные напоминания из БД и планирует их."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT reminder_id, user_id, text, time, days FROM reminders WHERE active = 1')
-    active_reminders = cursor.fetchall()
-    conn.close()
-
-    for r_id, user_id, text, time, days in active_reminders:
-        try:
-            # Для scheduler нам нужен контекст, но на старте его нет.
-            # Поэтому мы передаем application, чтобы получить bot и далее context
-            # Более надежный способ - хранить context.bot в глобальной переменной или получить через application.bot
-            schedule_reminder_job(application.job_queue.run_once, user_id, r_id, text, time, days)
-        except Exception as e:
-            logger.error(f"Ошибка при планировании напоминания {r_id} на старте: {e}")
-    logger.info(f"Загружено и запланировано {len(active_reminders)} активных напоминаний.")
-
-
-def main() -> None:
-    """Запускает бота."""
-    init_db() # Убедимся, что база данных инициализирована при запуске
-    
-    application = Application.builder().token(TOKEN).build()
-
-    # Для того чтобы APScheduler мог использовать await, его нужно запускать в asyncio loop
-    # application.run_polling() уже запускает asyncio loop
-    scheduler.start() # Запускаем планировщик
-
-    # Загружаем напоминания при старте
-    # Важно: load_reminders_on_startup должен иметь доступ к application.bot
-    # Мы можем запустить его после build() и до run_polling()
-    # Или как job_queue.run_once, который имеет доступ к context
-    # Для простоты и демонстрации, пока будем передавать application, но более надежно через job_queue
-    application.job_queue.run_once(
-        lambda context: load_reminders_on_startup_wrapper(context, application),
-        when=datetime.timedelta(seconds=5) # Даем боту немного времени на запуск перед загрузкой напоминаний
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет приветственное сообщение и предлагает создать напоминание."""
+    user_name = update.effective_user.first_name if update.effective_user else "друг"
+    await update.message.reply_text(
+        f"Привет, {user_name}! Я бот-напоминалка. ⏰\n\n"
+        "Я помогу тебе не забывать о важных делах.\n"
+        "Чтобы создать напоминание, набери /remind."
     )
 
-    # Добавляем обработчики
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("addreminder", add_reminder_command))
-    application.add_handler(CommandHandler("myreminders", show_my_reminders))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет сообщение с доступными командами."""
+    help_text = (
+        "Вот что я могу:\n\n"
+        "/remind - Создать новое напоминание.\n"
+        "/myreminders - Посмотреть список твоих активных напоминаний.\n"
+        "/help - Показать это сообщение помощи.\n\n"
+        "Для создания напоминания я сначала спрошу тебя, что напомнить, "
+        "потом когда, а затем с какой периодичностью."
+    )
+    await update.message.reply_text(help_text)
 
-    logger.info("Бот запущен и готов к работе!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Начинает процесс создания напоминания."""
+    chat_id = update.effective_chat.id
+    user_states[chat_id] = {'state': 'waiting_for_message'}
+    await update.message.reply_text("Что мне тебе напомнить? Например: 'Сделать зарядку'.")
 
+async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает список активных напоминаний пользователя."""
+    chat_id = update.effective_chat.id
+    reminders = get_reminders_from_db(is_sent=0)
+    user_reminders = [r for r in reminders if r[1] == chat_id] # r[1] - chat_id
 
-async def load_reminders_on_startup_wrapper(context: ContextTypes.DEFAULT_TYPE, application: Application):
-    """Обертка для запуска load_reminders_on_startup с доступом к контексту."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT reminder_id, user_id, text, time, days FROM reminders WHERE active = 1')
-    active_reminders = cursor.fetchall()
-    conn.close()
+    if not user_reminders:
+        await update.message.reply_text("У тебя пока нет активных напоминаний.")
+        return
 
-    for r_id, user_id, text, time, days in active_reminders:
+    text = "Твои активные напоминания:\n\n"
+    keyboard = []
+    for r_id, _, message, reminder_time_str, interval_type, specific_days_str in user_reminders:
+        rem_datetime = datetime.datetime.fromisoformat(reminder_time_str)
+        time_display = rem_datetime.strftime("%d.%m.%Y %H:%M")
+
+        interval_display = ""
+        if interval_type == 'once':
+            interval_display = "Однократно"
+        elif interval_type == 'daily':
+            interval_display = "Ежедневно"
+        elif interval_type == 'weekly':
+            interval_display = "Еженедельно"
+        elif interval_type == 'specific_days':
+            # import json # Уже импортирован в начале файла
+            days_map = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
+            selected_days_indices = json.loads(specific_days_str) if specific_days_str else []
+            selected_days_names = [days_map[i] for i in selected_days_indices if i in days_map]
+            interval_display = f"По дням: {', '.join(selected_days_names)}"
+            
+        text += f"*{message}* ({interval_display}) в *{time_display}*\n"
+        keyboard.append([InlineKeyboardButton(f"Удалить: {message[:20]}...", callback_data=f"delete_{r_id}")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает текстовый ввод пользователя в зависимости от состояния."""
+    chat_id = update.effective_chat.id
+    user_state = user_states.get(chat_id)
+
+    if user_state and user_state['state'] == 'waiting_for_message':
+        user_states[chat_id]['message'] = update.message.text
+        user_states[chat_id]['state'] = 'waiting_for_time'
+        await update.message.reply_text(
+            f"Отлично! '{update.message.text}'.\n\n"
+            "Теперь укажи время напоминания в формате *ДД.ММ.ГГГГ ЧЧ:ММ*.\n"
+            "Например: '25.12.2024 18:30'.",
+            parse_mode='Markdown'
+        )
+    elif user_state and user_state['state'] == 'waiting_for_time':
         try:
-            schedule_reminder_job(context, user_id, r_id, text, time, days)
-        except Exception as e:
-            logger.error(f"Ошибка при планировании напоминания {r_id} на старте: {e}")
-    logger.info(f"Загружено и запланировано {len(active_reminders)} активных напоминаний.")
+            # Парсим введенное время
+            reminder_time = datetime.datetime.strptime(update.message.text, "%d.%m.%Y %H:%M")
 
+            # Проверяем, что время не в прошлом
+            if reminder_time < datetime.datetime.now():
+                await update.message.reply_text("Время напоминания не может быть в прошлом. Пожалуйста, введи корректное время.")
+                return
+
+            user_states[chat_id]['reminder_time'] = reminder_time.isoformat() # Сохраняем как ISO-строку
+            user_states[chat_id]['state'] = 'waiting_for_interval'
+            await update.message.reply_text(
+                "Как часто напоминать?",
+                reply_markup=get_interval_keyboard()
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "Неверный формат времени. Пожалуйста, используй формат ДД.ММ.ГГГГ ЧЧ:ММ."
+            )
+    else:
+        await update.message.reply_text("Я тебя не понимаю. Используй /remind, чтобы начать создание напоминания.")
+
+
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатия кнопок на клавиатурах."""
+    query = update.callback_query
+    await query.answer() # Всегда отвечаем на callbackQuery
+
+    chat_id = query.message.chat_id
+    user_state = user_states.get(chat_id)
+
+    if query.data.startswith("interval_"):
+        # Обработка выбора интервала
+        interval_type = query.data.split('_')[1]
+        user_states[chat_id]['interval_type'] = interval_type
+
+        if interval_type == 'specific_days':
+            # Начинаем выбор дней недели
+            user_states[chat_id]['state'] = 'waiting_for_specific_days'
+            user_states[chat_id]['specific_days'] = [] # Инициализируем список выбранных дней
+            await query.edit_message_text(
+                text="Выбери дни недели:",
+                reply_markup=get_specific_days_keyboard()
+            )
+        else:
+            # Для однократных, ежедневных, еженедельных напоминаний
+            message_text = user_states[chat_id]['message']
+            reminder_time_iso = user_states[chat_id]['reminder_time']
+            
+            add_reminder_to_db(chat_id, message_text, reminder_time_iso, interval_type)
+            del user_states[chat_id] # Очищаем состояние
+            await query.edit_message_text(f"Напоминание '{message_text}' успешно создано!")
+
+    elif query.data.startswith("day_"):
+        # Обработка выбора конкретного дня недели
+        if user_state and user_state['state'] == 'waiting_for_specific_days':
+            day_index = int(query.data.split('_')[1])
+            if day_index in user_state['specific_days']:
+                user_state['specific_days'].remove(day_index) # Отменяем выбор
+            else:
+                user_state['specific_days'].append(day_index) # Выбираем
+            user_state['specific_days'].sort() # Для порядка
+
+            await query.edit_message_reply_markup(
+                reply_markup=get_specific_days_keyboard(user_state['specific_days'])
+            )
+
+    elif query.data == "confirm_days":
+        # Подтверждение выбора дней недели
+        if user_state and user_state['state'] == 'waiting_for_specific_days':
+            if not user_state['specific_days']:
+                await query.edit_message_text("Пожалуйста, выбери хотя бы один день недели.")
+                return
+
+            message_text = user_state[chat_id]['message']
+            reminder_time_iso = user_state[chat_id]['reminder_time']
+            specific_days_json = json.dumps(user_state[chat_id]['specific_days'])
+            
+            add_reminder_to_db(chat_id, message_text, reminder_time_iso, 'specific_days', specific_days_json)
+            del user_states[chat_id]
+            await query.edit_message_text(f"Напоминание '{message_text}' успешно создано по выбранным дням!")
+
+    elif query.data.startswith("delete_"):
+        # Обработка удаления напоминания
+        reminder_id = int(query.data.split('_')[1])
+        delete_reminder_from_db(reminder_id)
+        await query.edit_message_text("Напоминание удалено.")
+        # Можно обновить список напоминаний или предложить посмотреть /myreminders снова
+        # await my_reminders(update, context) # Если хотим сразу обновить список
+
+# --- Функция для планировщика (APScheduler) ---
+async def send_scheduled_reminders(bot):
+    """Проверяет напоминания в БД и отправляет их."""
+    now = datetime.datetime.now().replace(second=0, microsecond=0)
+    current_time_str = now.isoformat()
+    current_weekday = now.weekday() # Понедельник = 0, Воскресенье = 6
+
+    reminders = get_reminders_from_db(is_sent=0)
+
+    for r_id, chat_id, message, reminder_time_str, interval_type, specific_days_str in reminders:
+        try:
+            rem_datetime = datetime.datetime.fromisoformat(reminder_time_str)
+            rem_datetime = rem_datetime.replace(second=0, microsecond=0) # Обрезаем секунды
+
+            should_send = False
+
+            if interval_type == 'once':
+                if rem_datetime == now:
+                    should_send = True
+            elif interval_type == 'daily':
+                # Для ежедневных: время совпадает с текущим временем, без учета даты
+                if rem_datetime.time() == now.time():
+                    should_send = True
+            elif interval_type == 'weekly':
+                # Для еженедельных: время и день недели совпадают
+                if rem_datetime.weekday() == current_weekday and rem_datetime.time() == now.time():
+                    should_send = True
+            elif interval_type == 'specific_days':
+                # import json # Уже импортирован в начале файла
+                selected_days_indices = json.loads(specific_days_str) if specific_days_str else []
+                if current_weekday in selected_days_indices and rem_datetime.time() == now.time():
+                    should_send = True
+
+            if should_send:
+                await bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание: {message}")
+                logger.info(f"Отправлено напоминание с ID {r_id} для chat_id {chat_id}.")
+                # Для однократных напоминаний - помечаем как отправленное
+                if interval_type == 'once':
+                    mark_reminder_as_sent(r_id)
+                # Для повторяющихся напоминаний:
+                # В текущей реализации они останутся в БД с is_sent=0 и будут отправляться снова,
+                # когда условия совпадут. Это может привести к дублированию, если бот перезапустится
+                # в ту же минуту. Для предотвращения дублирования требуется более сложная логика,
+                # например, поле 'last_sent_timestamp' в БД и проверка по нему.
+
+        except Exception as e:
+            logger.error(f"Ошибка при обработке напоминания ID {r_id}: {e}", exc_info=True)
+
+
+# --- Главная функция бота ---
+async def main() -> None:
+    """Запускает бота."""
+    logging.info("Запуск бота...")
+
+    # Инициализация базы данных
+    init_db()
+
+    # Инициализация приложения бота
+    application = Application.builder().token(TOKEN).build()
+
+    # Настройка обработчиков
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("remind", remind))
+    application.add_handler(CommandHandler("myreminders", my_reminders))
+    application.add_handler(CallbackQueryHandler(button))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input))
+
+    # Инициализация и запуск планировщика
+    # Важно: APScheduler должен быть запущен в том же цикле событий, что и Telegram-бот
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        send_scheduled_reminders,
+        'interval',
+        seconds=60, # Проверяем напоминания каждую минуту
+        args=(application.bot,)
+    )
+    scheduler.start()
+    logging.info("Планировщик запущен.")
+
+    # Запускаем бота, пока пользователь не нажмет Ctrl-C или процесс не получит сигнал
+    logging.info("Бот запущен и работает!")
+    await application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
-    main()
+    # Это стандартный способ запуска асинхронной главной функции
+    try:
+        # asyncio.run() запускает цикл событий и выполняет асинхронную функцию
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем (KeyboardInterrupt).")
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при запуске бота: {e}", exc_info=True)
