@@ -1,9 +1,14 @@
+Вы можете переписать код без использования переменной окружения, полагаясь только на жёстко закодированный токен. Однако, как мы обсуждали ранее, это не рекомендуется для безопасности вашего бота, особенно если код может быть доступен другим. Ваш токен будет виден всем, кто имеет доступ к файлу.
+
+Обновлённый код бота (без использования os.environ):
+Вот код, где удалена проверка на переменную окружения, и бот всегда будет использовать токен, вставленный напрямую в TOKEN_HARDCODED.
+
+Python
 
 import logging
 import sqlite3
 import datetime
 import asyncio
-import os
 import json
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -24,20 +29,15 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING) # Уменьшаем шум от httpx
 logger = logging.getLogger(__name__)
 
-# --- Получение токена: сначала из переменной окружения, затем из кода ---
-# ВАЖНО: Для продакшена настоятельно рекомендуется использовать переменные окружения!
-# Вставьте ваш токен здесь, если НЕ используете переменные окружения на хостинге.
-TOKEN_HARDCODED = '8031651136:AAHyIOOfWUmny-p2Lz3072cxY3yhL5LNL0o' # <-- Вставьте ваш токен Telegram сюда!
+# --- Получение токена: ТОЛЬКО из кода (небезопасно для публичных репозиториев!) ---
+# Вставьте ваш токен Telegram здесь.
+# ВНИМАНИЕ: Если этот код будет выложен на GitHub или доступен другим,
+# ваш токен станет общедоступным, и ваш бот может быть скомпрометирован.
+# Настоятельно рекомендуется использовать переменные окружения на хостингах (например, Replit Secrets).
+TOKEN = '8031651136:AAHyIOOfWUmny-p2Lz3072cxY3yhL5LNL0o' # <-- Вставьте ваш токен Telegram сюда!
 
-TOKEN = os.environ.get('TOKEN') # Пытаемся получить токен из переменной окружения
-if not TOKEN:
-    # Если переменная окружения не установлена, используем жестко закодированный токен
-    TOKEN = TOKEN_HARDCODED
-    logger.warning("Токен Telegram взят из кода (не из переменных окружения). "
-                   "Рекомендуется использовать переменные окружения для продакшена.")
-
-if not TOKEN or TOKEN == '8031651136:AAHyIOOfWUmny-p2Lz3072cxY3yhL5LNL0o':
-    raise ValueError("Токен Telegram не установлен. Установите его как переменную окружения 'TOKEN' или вставьте в 'TOKEN_HARDCODED'.")
+if not TOKEN or TOKEN == 'ВАШ_ТОКЕН_БОТА_ЗДЕСЬ': # Проверка на заглушку
+    raise ValueError("Токен Telegram не установлен. Вставьте его в строку TOKEN = '...'")
 
 # --- Функции для работы с базой данных ---
 DB_NAME = 'reminders.db'
@@ -389,7 +389,6 @@ async def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input))
 
     # --- Инициализация планировщика ---
-    # Не запускаем его сразу, просто инициализируем
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         send_scheduled_reminders,
@@ -398,35 +397,23 @@ async def main() -> None:
         args=(application.bot,)
     )
     
-    # --- Запуск бота и планировщика: КЛЮЧЕВОЕ ИЗМЕНЕНИЕ ---
-    # Мы запускаем application.run_polling(), а затем, после того как он установит цикл событий,
-    # запускаем планировщик. Это более надежный подход для APScheduler в связке с PTB.
-    
-    # Запускаем бота, он будет работать в этом же цикле событий.
-    # Это вызов blocking-операции, которая запускает цикл событий.
-    logging.info("Бот запущен и работает!")
-    
-    # Регистрация хука для запуска планировщика ПОСЛЕ того, как Application инициализируется.
-    # Это гарантирует, что цикл событий будет уже активен.
-    async def post_init_callback(app: Application):
-        if not scheduler.running: # Убедимся, что не запускаем дважды
+    # --- Запуск планировщика через хук запуска Telegram Application ---
+    async def startup_scheduler_hook(app: Application):
+        if not scheduler.running:
             scheduler.start()
-            logging.info("APScheduler успешно запущен после инициализации Telegram Application.")
+            logging.info("APScheduler успешно запущен через startup hook.")
 
-    application.post_init(post_init_callback)
+    application.add_startup_hook(startup_scheduler_hook)
 
-    # await application.run_polling() сам по себе блокирует выполнение до его завершения
-    # поэтому весь код после него не будет выполнен.
-    # Используем его как точку входа в asyncio-цикл.
+    logging.info("Бот запущен и ожидает обновлений...")
     await application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == '__main__':
-    # Эта часть кода запускает главную асинхронную функцию `main()`
-    # и управляет циклом событий `asyncio`.
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем (KeyboardInterrupt).")
     except Exception as e:
         logger.error(f"Непредвиденная ошибка при запуске бота: {e}", exc_info=True)
+
