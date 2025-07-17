@@ -1,10 +1,11 @@
 
+
 import logging
 import sqlite3
 import datetime
 import asyncio
 import os
-import json # Добавляем для работы с JSON, если ещё не было
+import json # Добавляем для работы с JSON
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,8 +26,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING) # Уменьшаем шум
 logger = logging.getLogger(__name__)
 
 # --- Получение токена: сначала из переменной окружения, затем из кода ---
-TOKEN_HARDCODED = '8031651136:AAFn6zQlfNO4WBdDxACko_MlBzJ19lmocBY' # <-- Вставьте ваш токен сюда, если не используете переменные окружения!
-                                       # Например: '1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+# ВАЖНО: Для продакшена настоятельно рекомендуется использовать переменные окружения!
+# Вставьте ваш токен здесь, если НЕ используете переменные окружения на хостинге.
+TOKEN_HARDCODED = '8031651136:AAFn6zQlfNO4WBdDxACko_MlBzJ19lmocBY' 
 
 TOKEN = os.environ.get('TOKEN') # Пытаемся получить токен из переменной окружения
 if not TOKEN:
@@ -35,7 +37,7 @@ if not TOKEN:
     logger.warning("Токен Telegram взят из кода (не из переменных окружения). "
                    "Рекомендуется использовать переменные окружения для продакшена.")
 
-if not TOKEN or TOKEN == 'ВАШ_ТОКЕН_БОТА_ЗДЕСЬ':
+if not TOKEN or TOKEN == '8031651136:AAFn6zQlfNO4WBdDxACko_MlBzJ19lmocBY':
     raise ValueError("Токен Telegram не установлен. Установите его как переменную окружения 'TOKEN' или вставьте в 'TOKEN_HARDCODED'.")
 
 # --- Функции для работы с базой данных ---
@@ -203,7 +205,7 @@ async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         elif interval_type == 'weekly':
             interval_display = "Еженедельно"
         elif interval_type == 'specific_days':
-            # import json # Уже импортирован в начале файла
+            # `json` уже импортирован в начале файла
             days_map = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
             selected_days_indices = json.loads(specific_days_str) if specific_days_str else []
             selected_days_names = [days_map[i] for i in selected_days_indices if i in days_map]
@@ -305,8 +307,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
 
             message_text = user_state[chat_id]['message']
-            reminder_time_iso = user_state[chat_id]['reminder_time']
-            specific_days_json = json.dumps(user_state[chat_id]['specific_days'])
+            reminder_time_iso = user_states[chat_id]['reminder_time']
+            specific_days_json = json.dumps(user_states[chat_id]['specific_days'])
             
             add_reminder_to_db(chat_id, message_text, reminder_time_iso, 'specific_days', specific_days_json)
             del user_states[chat_id]
@@ -324,7 +326,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def send_scheduled_reminders(bot):
     """Проверяет напоминания в БД и отправляет их."""
     now = datetime.datetime.now().replace(second=0, microsecond=0)
-    current_time_str = now.isoformat()
     current_weekday = now.weekday() # Понедельник = 0, Воскресенье = 6
 
     reminders = get_reminders_from_db(is_sent=0)
@@ -348,7 +349,7 @@ async def send_scheduled_reminders(bot):
                 if rem_datetime.weekday() == current_weekday and rem_datetime.time() == now.time():
                     should_send = True
             elif interval_type == 'specific_days':
-                # import json # Уже импортирован в начале файла
+                # `json` уже импортирован в начале файла
                 selected_days_indices = json.loads(specific_days_str) if specific_days_str else []
                 if current_weekday in selected_days_indices and rem_datetime.time() == now.time():
                     should_send = True
@@ -388,9 +389,11 @@ async def main() -> None:
     application.add_handler(CallbackQueryHandler(button))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input))
 
-    # Инициализация и запуск планировщика
-    # Важно: APScheduler должен быть запущен в том же цикле событий, что и Telegram-бот
-    scheduler = AsyncIOScheduler()
+    # Инициализация планировщика
+    # Важно: Получаем текущий цикл событий и явно передаем его APScheduler
+    current_loop = asyncio.get_event_loop()
+    scheduler = AsyncIOScheduler(event_loop=current_loop) # Передаем цикл событий явно
+
     scheduler.add_job(
         send_scheduled_reminders,
         'interval',
