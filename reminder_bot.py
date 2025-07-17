@@ -1,11 +1,10 @@
 
-
 import logging
 import sqlite3
 import datetime
 import asyncio
 import os
-import json # Добавляем для работы с JSON, если ещё не было
+import json
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -390,6 +389,7 @@ async def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input))
 
     # --- Инициализация планировщика ---
+    # Не запускаем его сразу, просто инициализируем
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         send_scheduled_reminders,
@@ -398,24 +398,33 @@ async def main() -> None:
         args=(application.bot,)
     )
     
-    # --- Запуск планировщика как callback для Telegram-бота ---
-    # Это самое надежное место для запуска планировщика, так как оно гарантирует,
-    # что цикл событий asyncio уже запущен и активен.
-    async def start_scheduler_callback(app: Application):
-        if not scheduler.running: # Проверяем, чтобы избежать повторного запуска
-            scheduler.start()
-            logging.info("Планировщик запущен через callback после инициализации Application.")
-
-    application.post_init(start_scheduler_callback) # Регистрируем callback
-
-    # Запускаем бота, пока пользователь не нажмет Ctrl-C или процесс не получит сигнал
+    # --- Запуск бота и планировщика: КЛЮЧЕВОЕ ИЗМЕНЕНИЕ ---
+    # Мы запускаем application.run_polling(), а затем, после того как он установит цикл событий,
+    # запускаем планировщик. Это более надежный подход для APScheduler в связке с PTB.
+    
+    # Запускаем бота, он будет работать в этом же цикле событий.
+    # Это вызов blocking-операции, которая запускает цикл событий.
     logging.info("Бот запущен и работает!")
+    
+    # Регистрация хука для запуска планировщика ПОСЛЕ того, как Application инициализируется.
+    # Это гарантирует, что цикл событий будет уже активен.
+    async def post_init_callback(app: Application):
+        if not scheduler.running: # Убедимся, что не запускаем дважды
+            scheduler.start()
+            logging.info("APScheduler успешно запущен после инициализации Telegram Application.")
+
+    application.post_init(post_init_callback)
+
+    # await application.run_polling() сам по себе блокирует выполнение до его завершения
+    # поэтому весь код после него не будет выполнен.
+    # Используем его как точку входа в asyncio-цикл.
     await application.run_polling(drop_pending_updates=True)
 
+
 if __name__ == '__main__':
-    # Это стандартный способ запуска асинхронной главной функции
+    # Эта часть кода запускает главную асинхронную функцию `main()`
+    # и управляет циклом событий `asyncio`.
     try:
-        # asyncio.run() запускает цикл событий и выполняет асинхронную функцию
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем (KeyboardInterrupt).")
