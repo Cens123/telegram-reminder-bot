@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # --- Получение токена: сначала из переменной окружения, затем из кода ---
 # ВАЖНО: Для продакшена настоятельно рекомендуется использовать переменные окружения!
 # Вставьте ваш токен здесь, если НЕ используете переменные окружения на хостинге.
-TOKEN_HARDCODED = '8031651136:AAFn6zQlfNO4WBdDxACko_MlBzJ19lmocBY' # <-- Вставьте ваш токен Telegram сюда!
+TOKEN_HARDCODED = '8031651136:AAHyIOOfWUmny-p2Lz3072cxY3yhL5LNL0o' # <-- Вставьте ваш токен Telegram сюда!
 
 TOKEN = os.environ.get('TOKEN') # Пытаемся получить токен из переменной окружения
 if not TOKEN:
@@ -36,7 +36,7 @@ if not TOKEN:
     logger.warning("Токен Telegram взят из кода (не из переменных окружения). "
                    "Рекомендуется использовать переменные окружения для продакшена.")
 
-if not TOKEN or TOKEN == '8031651136:AAFn6zQlfNO4WBdDxACko_MlBzJ19lmocBY':
+if not TOKEN or TOKEN == '8031651136:AAHyIOOfWUmny-p2Lz3072cxY3yhL5LNL0o':
     raise ValueError("Токен Telegram не установлен. Установите его как переменную окружения 'TOKEN' или вставьте в 'TOKEN_HARDCODED'.")
 
 # --- Функции для работы с базой данных ---
