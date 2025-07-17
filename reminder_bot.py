@@ -1,3 +1,24 @@
+from flask import Flask
+from threading import Thread
+
+# Инициализируем Flask приложение
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_flask():
+    # Запускаем Flask-сервер на порту 8080 (или другом, который Replit предоставит)
+    # host='0.0.0.0' делает сервер доступным извне
+    app.run(host='0.0.0.0', port=8080) # Replit предоставит порт, но 8080 часто работает по умолчанию
+
+# Запускаем Flask-сервер в отдельном потоке, чтобы он не блокировал бота
+def keep_alive():
+    t = Thread(target=run_flask)
+    t.start()
+
+
 import logging
 import sqlite3
 import datetime
@@ -402,6 +423,20 @@ def main() -> None:
 
 
 if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем (KeyboardInterrupt).")
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при запуске бота: {e}", exc_info=True)
+
+def main() -> None:
+    # ... (весь код main()) ...
+    application.run_polling(drop_pending_updates=True) # Эта строка уже есть
+
+if __name__ == '__main__':
+    # Добавляем вызов keep_alive() перед запуском бота
+    keep_alive() # <--- Эту строку нужно добавить
     try:
         main()
     except KeyboardInterrupt:
