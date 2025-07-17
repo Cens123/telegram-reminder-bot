@@ -4,7 +4,7 @@ import datetime
 import asyncio
 import json
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.blocking import BlockingScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -315,7 +315,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # await my_reminders(update, context) # Если хотим сразу обновить список
 
 # --- Функция для планировщика (APScheduler) ---
-async def send_scheduled_reminders(bot):
+def send_scheduled_reminders(bot):
     """Проверяет напоминания в БД и отправляет их."""
     now = datetime.datetime.now().replace(second=0, microsecond=0)
     current_weekday = now.weekday() # Понедельник = 0, Воскресенье = 6
@@ -347,7 +347,8 @@ async def send_scheduled_reminders(bot):
                     should_send = True
 
             if should_send:
-                await bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание: {message}")
+                import asyncio
+                asyncio.create_task(bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание: {message}"))
                 logger.info(f"Отправлено напоминание с ID {r_id} для chat_id {chat_id}.")
                 # Для однократных напоминаний - помечаем как отправленное
                 if interval_type == 'once':
@@ -363,7 +364,7 @@ async def send_scheduled_reminders(bot):
 
 
 # --- Главная функция бота ---
-async def main() -> None:
+def main() -> None:
     """Запускает бота."""
     logging.info("Запуск бота...")
 
@@ -382,7 +383,7 @@ async def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input))
 
     # --- Инициализация планировщика ---
-    scheduler = AsyncIOScheduler()
+    scheduler = BlockingScheduler()
     scheduler.add_job(
         send_scheduled_reminders,
         'interval',
@@ -390,18 +391,19 @@ async def main() -> None:
         args=(application.bot,)
     )
     
-    # --- Запуск планировщика напрямую перед запуском бота ---
-    # Этот подход подходит для python-telegram-bot версий до v20.
-    logging.info("Запуск APScheduler...")
-    scheduler.start()
+    # Запускаем планировщик в отдельном потоке
+    import threading
+    scheduler_thread = threading.Thread(target=scheduler.start)
+    scheduler_thread.daemon = True
+    scheduler_thread.start()
     
     logging.info("Бот запущен и ожидает обновлений...")
-    await application.run_polling(drop_pending_updates=True)
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем (KeyboardInterrupt).")
     except Exception as e:
