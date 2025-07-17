@@ -1,4 +1,3 @@
-
 import logging
 import sqlite3
 import datetime
@@ -391,14 +390,11 @@ async def main() -> None:
         args=(application.bot,)
     )
     
-    # --- Запуск планировщика через хук запуска Telegram Application ---
-    async def startup_scheduler_hook(app: Application):
-        if not scheduler.running:
-            scheduler.start()
-            logging.info("APScheduler успешно запущен через startup hook.")
-
-    application.add_startup_hook(startup_scheduler_hook)
-
+    # --- Запуск планировщика напрямую перед запуском бота ---
+    # Этот подход подходит для python-telegram-bot версий до v20.
+    logging.info("Запуск APScheduler...")
+    scheduler.start()
+    
     logging.info("Бот запущен и ожидает обновлений...")
     await application.run_polling(drop_pending_updates=True)
 
@@ -410,4 +406,3 @@ if __name__ == '__main__':
         logger.info("Бот остановлен пользователем (KeyboardInterrupt).")
     except Exception as e:
         logger.error(f"Непредвиденная ошибка при запуске бота: {e}", exc_info=True)
-
