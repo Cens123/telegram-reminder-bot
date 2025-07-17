@@ -5,7 +5,7 @@ import sqlite3
 import datetime
 import asyncio
 import os
-import json # Добавляем для работы с JSON
+import json # Добавляем для работы с JSON, если ещё не было
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # --- Получение токена: сначала из переменной окружения, затем из кода ---
 # ВАЖНО: Для продакшена настоятельно рекомендуется использовать переменные окружения!
 # Вставьте ваш токен здесь, если НЕ используете переменные окружения на хостинге.
-TOKEN_HARDCODED = '8031651136:AAFn6zQlfNO4WBdDxACko_MlBzJ19lmocBY' 
+TOKEN_HARDCODED = '8031651136:AAFn6zQlfNO4WBdDxACko_MlBzJ19lmocBY' # <-- Вставьте ваш токен Telegram сюда!
 
 TOKEN = os.environ.get('TOKEN') # Пытаемся получить токен из переменной окружения
 if not TOKEN:
@@ -389,19 +389,24 @@ async def main() -> None:
     application.add_handler(CallbackQueryHandler(button))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_input))
 
-    # Инициализация планировщика
-    # Важно: Получаем текущий цикл событий и явно передаем его APScheduler
-    current_loop = asyncio.get_event_loop()
-    scheduler = AsyncIOScheduler(event_loop=current_loop) # Передаем цикл событий явно
-
+    # --- Инициализация планировщика ---
+    scheduler = AsyncIOScheduler()
     scheduler.add_job(
         send_scheduled_reminders,
         'interval',
         seconds=60, # Проверяем напоминания каждую минуту
         args=(application.bot,)
     )
-    scheduler.start()
-    logging.info("Планировщик запущен.")
+    
+    # --- Запуск планировщика как callback для Telegram-бота ---
+    # Это самое надежное место для запуска планировщика, так как оно гарантирует,
+    # что цикл событий asyncio уже запущен и активен.
+    async def start_scheduler_callback(app: Application):
+        if not scheduler.running: # Проверяем, чтобы избежать повторного запуска
+            scheduler.start()
+            logging.info("Планировщик запущен через callback после инициализации Application.")
+
+    application.post_init(start_scheduler_callback) # Регистрируем callback
 
     # Запускаем бота, пока пользователь не нажмет Ctrl-C или процесс не получит сигнал
     logging.info("Бот запущен и работает!")
